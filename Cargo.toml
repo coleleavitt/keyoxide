@@ -1,0 +1,55 @@
+[package]
+name = "keyoxide"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal no-prompt SSH and GPG agent"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# SSH key handling
+ssh-key = { version = "0.6", features = ["encryption", "ed25519", "rsa", "p256", "p384"] }
+signature = "2"
+
+# Cryptography
+rsa = { version = "0.9", features = ["sha2"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+sha1 = "0.10"
+rand = "0.8"
+aes = "0.8"
+cbc = "0.1"
+ocb3 = "0.1"
+
+# GPG S-expression parsing
+lexpr = "0.2"
+
+# Security
+secrecy = { version = "0.10", features = ["serde"] }
+zeroize = { version = "1", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+hex = "0.4"
+base64 = "0.22"
+dirs = "6"
+bytes = "1"
+parking_lot = "0.12"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true

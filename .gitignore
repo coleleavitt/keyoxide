@@ -1,0 +1,12 @@
+/target
+
+# Editor/agent state
+/.jfc/
+
+# Local backups
+*.bak
+*.bak.*
+
+# Secrets — never commit
+passphrase
+*.key
