@@ -215,8 +215,7 @@ fn parse_keyinfo(args: &str) -> Result<Command> {
     // Extract keygrip if present (last argument after options)
     let keygrip = args
         .split_whitespace()
-        .filter(|s| !s.starts_with("--"))
-        .last()
+        .rfind(|s| !s.starts_with("--"))
         .filter(|s| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()))
         .map(|s| s.to_uppercase());
 

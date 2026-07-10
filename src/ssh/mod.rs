@@ -13,23 +13,17 @@ use tracing::{debug, error, info, warn};
 use crate::agent::AgentState;
 use crate::error::Result;
 
-pub async fn run_ssh_agent(listener: UnixListener, state: Arc<AgentState>) -> Result<()> {
+pub async fn run_ssh_agent(listener: &UnixListener, state: Arc<AgentState>) -> Result<()> {
     info!("SSH agent listening");
 
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, state).await {
-                        debug!("SSH connection ended: {}", e);
-                    }
-                });
+        let (stream, _) = listener.accept().await?;
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream, state).await {
+                debug!("SSH connection ended: {}", e);
             }
-            Err(e) => {
-                error!("failed to accept SSH connection: {}", e);
-            }
-        }
+        });
     }
 }
 

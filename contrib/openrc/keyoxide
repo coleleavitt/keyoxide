@@ -1,0 +1,33 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh disable=SC2034
+
+description="Keyoxide SSH and GPG agent"
+supervisor=supervise-daemon
+command="${KEYOXIDE_BIN:-${HOME}/.cargo/bin/keyoxide}"
+command_args="--replace"
+directory="${HOME}"
+umask=0077
+
+respawn_delay=2
+respawn_max=5
+respawn_period=60
+retry="TERM/5/KILL/5"
+
+state_dir="${XDG_STATE_HOME:-${HOME}/.local/state}/keyoxide"
+output_log="${state_dir}/stdout.log"
+error_log="${state_dir}/stderr.log"
+
+start_pre() {
+    if [ ! -x "${command}" ]; then
+        eerror "Keyoxide binary is not executable: ${command}"
+        return 1
+    fi
+
+    config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+    if [ ! -r "${config_home}/keyoxide/passphrase" ] && [ -z "${KEYOXIDE_PASSPHRASE}" ]; then
+        eerror "No Keyoxide passphrase is configured"
+        return 1
+    fi
+
+    checkpath --directory --mode 0700 "${state_dir}"
+}

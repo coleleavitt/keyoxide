@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::fs;
 
 use keyoxide::gpg::sexp::{CanonicalParser, parse_gpg_sexp};
@@ -112,7 +114,7 @@ fn main() {
         hole_end - hole_begin
     );
     println!("Ciphertext: {} bytes", ciphertext.len());
-    println!("Salt: {}", hex::encode(&salt));
+    println!("Salt: {}", hex::encode(salt));
     println!("S2K count: {}", s2k_count);
     println!("Nonce: {}", hex::encode(&nonce));
 

@@ -122,7 +122,7 @@ pub fn load_gpg_keys(dir: &Path, passphrase: &str) -> Vec<GpgKey> {
     for entry in entries.flatten() {
         let path = entry.path();
 
-        if path.extension().map_or(true, |e| e != "key") {
+        if path.extension().is_none_or(|extension| extension != "key") {
             continue;
         }
 
@@ -211,7 +211,7 @@ fn parse_protected_key(content: &str, passphrase: &str) -> Result<GpgKeyType> {
 
     debug!(
         "salt={} s2k={} nonce={} ct_len={} is_ocb={}",
-        hex::encode(&params.salt),
+        hex::encode(params.salt),
         params.s2k_count,
         hex::encode(&params.nonce),
         params.ciphertext.len(),
@@ -219,7 +219,6 @@ fn parse_protected_key(content: &str, passphrase: &str) -> Result<GpgKeyType> {
     );
 
     let key = derive_s2k_key(passphrase, &params.salt, params.s2k_count, 16);
-    debug!("derived key: {}", hex::encode(&*key));
 
     let decrypted = if params.is_ocb {
         decrypt_ocb(&key, &params.nonce, &aad1, &aad2, &params.ciphertext)?
@@ -413,7 +412,7 @@ fn decrypt_ocb(
         ocb.decrypt_in_place_detached(nonce_arr, &aad_combined, &mut buffer, tag_arr)
             .map_err(|_| Error::KeyDecryptionFailed)?;
 
-        return Ok(buffer);
+        Ok(buffer)
     }
 }
 
@@ -569,4 +568,35 @@ fn extract_mpi(content: &str, name: &'static str) -> Result<Vec<u8>> {
         .collect();
 
     hex::decode(&hex_str).map_err(Error::HexDecode)
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing_test::traced_test;
+
+    use super::*;
+
+    const JUNK_PROTECTED_RSA: &str = r#"
+(protected-private-key
+  (rsa
+    (n #01#)
+    (e #010001#)
+    (protected openpgp-s2k3-sha1-aes-cbc
+      ((sha1 #0001020304050607# "1")
+       #00000000000000000000000000000000#)
+      #00000000000000000000000000000000#)))
+"#;
+
+    #[test]
+    #[traced_test]
+    fn protected_key_debug_logs_never_expose_derived_key_material() {
+        const PASSPHRASE: &str = "sentinel-passphrase";
+        const SALT: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+        let leaked = hex::encode(&*derive_s2k_key(PASSPHRASE, &SALT, 1, 16));
+        let _ = parse_protected_key(JUNK_PROTECTED_RSA, PASSPHRASE);
+
+        assert!(!logs_contain("derived key:"));
+        assert!(!logs_contain(&leaked));
+    }
 }

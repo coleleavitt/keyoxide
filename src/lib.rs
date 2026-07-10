@@ -1,7 +1,10 @@
 pub mod agent;
+pub mod cli;
 pub mod config;
 pub mod error;
 pub mod gpg;
+pub mod health;
+pub mod socket;
 pub mod ssh;
 
 pub use agent::AgentState;

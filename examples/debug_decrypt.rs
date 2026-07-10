@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::fs;
 
 use keyoxide::gpg::sexp::{CanonicalParser, parse_gpg_sexp};

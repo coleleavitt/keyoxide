@@ -13,23 +13,17 @@ use tracing::{debug, error, info, trace};
 use crate::agent::AgentState;
 use crate::error::Result;
 
-pub async fn run_gpg_agent(listener: UnixListener, state: Arc<AgentState>) -> Result<()> {
+pub async fn run_gpg_agent(listener: &UnixListener, state: Arc<AgentState>) -> Result<()> {
     info!("GPG agent listening");
 
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, state).await {
-                        debug!("GPG connection ended: {}", e);
-                    }
-                });
+        let (stream, _) = listener.accept().await?;
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream, state).await {
+                debug!("GPG connection ended: {}", e);
             }
-            Err(e) => {
-                error!("failed to accept GPG connection: {}", e);
-            }
-        }
+        });
     }
 }
 
@@ -207,7 +201,10 @@ fn handle_command(cmd: &Command, state: &AgentState, session: &mut SessionState)
         }
 
         Command::GetInfo { what } => match what.as_str() {
-            "version" => vec![Response::data(b"2.4.0".to_vec()), Response::ok()],
+            "version" => vec![
+                Response::data(gpg_compat_version().as_bytes().to_vec()),
+                Response::ok(),
+            ],
             "pid" => {
                 let pid = std::process::id().to_string();
                 vec![Response::data(pid.into_bytes()), Response::ok()]
@@ -228,6 +225,25 @@ fn handle_command(cmd: &Command, state: &AgentState, session: &mut SessionState)
             }
         }
     }
+}
+
+fn gpg_compat_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        std::process::Command::new("gpg-agent")
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                let first_line = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()?
+                    .to_owned();
+                first_line.split_whitespace().last().map(str::to_owned)
+            })
+            .unwrap_or_else(|| "2.4.0".to_owned())
+    })
 }
 
 /// Append a canonical S-expression atom (`<len>:<bytes>`).

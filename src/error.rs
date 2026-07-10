@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -61,6 +63,27 @@ pub enum Error {
 
     #[error("socket path error: {0}")]
     SocketPath(String),
+
+    #[error("socket is already in use: {0}")]
+    SocketInUse(PathBuf),
+
+    #[error("refusing to replace non-socket path: {0}")]
+    SocketNotSocket(PathBuf),
+
+    #[error("socket changed while it was being inspected: {0}")]
+    SocketChanged(PathBuf),
+
+    #[error("failed to probe socket {path}: {source}")]
+    SocketProbe {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("agent health check failed: {0}")]
+    AgentUnhealthy(String),
+
+    #[error("command failed: {0}")]
+    CommandFailed(String),
 
     #[error("configuration error: {0}")]
     Config(String),

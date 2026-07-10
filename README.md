@@ -3,7 +3,7 @@
 A minimal, no-prompt SSH and GPG agent. It loads your existing OpenSSH and
 GnuPG private keys at startup (decrypting them once with a configured
 passphrase) and serves signing requests over the standard SSH-agent and
-gpg-agent sockets — without ever prompting interactively.
+gpg-agent sockets without prompting interactively.
 
 > **Security note:** keyoxide holds decrypted private keys in memory and signs
 > for any client that can reach its sockets. Run it only on a trusted machine
@@ -14,19 +14,58 @@ gpg-agent sockets — without ever prompting interactively.
 The passphrase used to decrypt your keys is read from, in order:
 
 1. the `KEYOXIDE_PASSPHRASE` environment variable, or
-2. `~/.config/keyoxide/passphrase` (a single line, mode `0600`).
+2. `~/.config/keyoxide/passphrase` (a single line, owned by the current user
+   and inaccessible to group/others).
 
 Keys are loaded from `~/.ssh` (SSH) and `~/.gnupg/private-keys-v1.d` (GPG).
+Key files protected by a different passphrase are skipped with a warning.
 
 ## Build & run
 
 ```sh
 cargo build --release
-KEYOXIDE_PASSPHRASE=… ./target/release/keyoxide
+./target/release/keyoxide --replace
 ```
 
-The agent prints the `SSH_AUTH_SOCK` / `GPG_AGENT_INFO` exports to wire up your
-shell.
+`--replace` explicitly stops the native `gpg-agent` before Keyoxide binds the
+canonical GPG socket. Without that flag, Keyoxide refuses to unlink any live
+socket. Stale sockets are reclaimed safely, and partial startup is rolled back.
+
+The agent prints the `SSH_AUTH_SOCK` export for your shell. Modern GnuPG ignores
+`GPG_AGENT_INFO`, so GPG requests reach Keyoxide only while it owns the socket
+reported by `gpgconf --list-dirs agent-socket`.
+
+Check both protocols without loading private keys or creating sockets:
+
+```sh
+keyoxide --check
+```
+
+`--help` and `--version` are also available. Unknown or combined options fail
+instead of starting the daemon.
+
+## OpenRC user service
+
+On an OpenRC system with user services enabled, install and supervise Keyoxide
+without root:
+
+```sh
+cargo install --path .
+install -Dm755 contrib/openrc/keyoxide ~/.config/rc/init.d/keyoxide
+rc-update --user add keyoxide default
+rc-service --user keyoxide start
+keyoxide --check
+```
+
+Logs are written under `${XDG_STATE_HOME:-~/.local/state}/keyoxide/`. Remove any
+shell-startup snippet that launches Keyoxide directly after enabling the
+service; OpenRC handles startup, cleanup, and crash restarts, while
+`keyoxide --check` reports protocol health. Shells still need the export itself
+(but must not launch the daemon):
+
+```sh
+export SSH_AUTH_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/keyoxide/ssh.sock"
+```
 
 ## Supported keys
 
