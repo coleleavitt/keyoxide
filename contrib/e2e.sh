@@ -69,7 +69,8 @@ start_keyoxide() {
   : > "$R/kx.log"
   RUST_LOG=keyoxide=${KX_LOG:-info} "$KX_BIN" --replace >"$R/kx.log" 2>&1 &
   KXPID=$!
-  for i in $(seq 1 40); do grep -q 'GPG agent listening' "$R/kx.log" && break; sleep 0.1; done
+  # Unlocking takes ~0.25 s per key (GnuPG's S2K count); wait up to 30 s.
+  for i in $(seq 1 300); do grep -q 'GPG agent listening' "$R/kx.log" && break; sleep 0.1; done
   greet=$(timeout 3 socat - UNIX-CONNECT:"$(gpgconf --list-dirs agent-socket)" </dev/null 2>/dev/null | head -1)
   case "$greet" in *keyoxide*) ;; *) echo "ABORT: keyoxide did not take the socket (greeting: $greet)"; sed 's/\x1b\[[0-9;]*m//g' "$R/kx.log" | tail -15; exit 1;; esac
   grep -E 'loaded [0-9]+ (GPG|SSH)' "$R/kx.log" | sed 's/\x1b\[[0-9;]*m//g; s/.*keyoxide[^ ]*: //' | tr '\n' ' '; echo
