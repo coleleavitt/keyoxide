@@ -9,6 +9,15 @@ use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 
+/// The hash an RSA signature uses: chosen by the client's flags, with
+/// SHA-1 (`ssh-rsa`) when it sets neither SHA-2 flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsaHash {
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
 pub struct SshKey {
     pub private_key: PrivateKey,
     pub public_blob: Bytes,
@@ -24,13 +33,11 @@ impl SshKey {
     /// Sign data using the underlying crypto libraries directly.
     ///
     /// Returns raw signature bytes suitable for SSH agent protocol (not SshSig format).
-    pub fn sign(&self, data: &[u8], hash_alg: Option<HashAlg>) -> Result<Vec<u8>> {
+    pub fn sign(&self, data: &[u8], rsa_hash: RsaHash) -> Result<Vec<u8>> {
         use ssh_key::private::KeypairData;
 
         match self.private_key.key_data() {
-            KeypairData::Rsa(rsa_keypair) => {
-                self.sign_rsa(rsa_keypair, data, hash_alg.unwrap_or(HashAlg::Sha256))
-            }
+            KeypairData::Rsa(rsa_keypair) => self.sign_rsa(rsa_keypair, data, rsa_hash),
             KeypairData::Ed25519(ed25519_keypair) => self.sign_ed25519(ed25519_keypair, data),
             KeypairData::Ecdsa(ecdsa_keypair) => self.sign_ecdsa(ecdsa_keypair, data),
             _ => Err(Error::UnsupportedKeyType(format!(
@@ -44,7 +51,7 @@ impl SshKey {
         &self,
         keypair: &ssh_key::private::RsaKeypair,
         data: &[u8],
-        hash_alg: HashAlg,
+        hash: RsaHash,
     ) -> Result<Vec<u8>> {
         // Extract RSA key components from ssh-key's representation
         let p = rsa::BigUint::from_bytes_be(keypair.private.p.as_bytes());
@@ -54,16 +61,16 @@ impl SshKey {
         let rsa_key = rsa::RsaPrivateKey::from_p_q(p, q, e)?;
         let mut rng = rand::rngs::OsRng;
 
-        let sig_bytes = match hash_alg {
-            HashAlg::Sha256 => {
-                let signing_key = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(rsa_key);
-                signing_key.try_sign_with_rng(&mut rng, data)?.to_bytes()
-            }
-            HashAlg::Sha512 => {
-                let signing_key = rsa::pkcs1v15::SigningKey::<sha2::Sha512>::new(rsa_key);
-                signing_key.try_sign_with_rng(&mut rng, data)?.to_bytes()
-            }
-            _ => return Err(Error::UnsupportedAlgorithm(format!("{:?}", hash_alg))),
+        let sig_bytes = match hash {
+            RsaHash::Sha1 => rsa::pkcs1v15::SigningKey::<sha1::Sha1>::new(rsa_key)
+                .try_sign_with_rng(&mut rng, data)?
+                .to_bytes(),
+            RsaHash::Sha256 => rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(rsa_key)
+                .try_sign_with_rng(&mut rng, data)?
+                .to_bytes(),
+            RsaHash::Sha512 => rsa::pkcs1v15::SigningKey::<sha2::Sha512>::new(rsa_key)
+                .try_sign_with_rng(&mut rng, data)?
+                .to_bytes(),
         };
 
         Ok(sig_bytes.to_vec())
@@ -141,63 +148,47 @@ fn encode_ecdsa_blob(r: &[u8], s: &[u8]) -> Vec<u8> {
     blob
 }
 
-pub fn load_ssh_keys(dir: &Path, passphrase: &str) -> Vec<SshKey> {
-    let mut keys = Vec::new();
-
+/// Files in `dir` that look like private keys: not `.pub`, not ssh config
+/// files, and either paired with a `.pub` file or containing "PRIVATE KEY".
+pub fn key_candidates(dir: &Path) -> Vec<std::path::PathBuf> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
             warn!("failed to read SSH key directory {:?}: {}", dir, e);
-            return keys;
+            return Vec::new();
         }
     };
 
+    let mut paths = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-
-        if path.extension().is_some_and(|e| e == "pub") {
+        if path.extension().is_some_and(|e| e == "pub") || !path.is_file() {
             continue;
         }
-
-        if !path.is_file() {
-            continue;
-        }
-
-        // Skip known non-key files
         let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if filename == "config"
-            || filename == "known_hosts"
-            || filename == "known_hosts.old"
-            || filename == "authorized_keys"
-            || filename.ends_with(".old")
+        if matches!(
+            filename,
+            "config" | "known_hosts" | "known_hosts.old" | "authorized_keys"
+        ) || filename.ends_with(".old")
         {
             continue;
         }
-
-        // Only load if there's a corresponding .pub file (indicates it's a key pair)
-        let pub_path = path.with_extension(format!(
-            "{}.pub",
-            path.extension()
-                .map(|e| e.to_str().unwrap_or(""))
-                .unwrap_or("")
-        ));
-        let pub_path_alt = {
-            let mut p = path.clone();
-            p.set_extension("pub");
-            p
-        };
-        if !pub_path.exists() && !pub_path_alt.exists() && !path.to_string_lossy().contains(".pub")
-        {
-            // Check if file content looks like an SSH key
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if !content.contains("PRIVATE KEY") {
-                    continue;
-                }
-            } else {
-                continue;
-            }
+        let mut pub_path = path.clone().into_os_string();
+        pub_path.push(".pub");
+        let paired =
+            std::path::Path::new(&pub_path).exists() || path.with_extension("pub").exists();
+        let looks_like_key =
+            || std::fs::read_to_string(&path).is_ok_and(|content| content.contains("PRIVATE KEY"));
+        if paired || looks_like_key() {
+            paths.push(path);
         }
+    }
+    paths
+}
 
+pub fn load_ssh_keys(dir: &Path, passphrase: &str) -> Vec<SshKey> {
+    let mut keys = Vec::new();
+    for path in key_candidates(dir) {
         match load_single_key(&path, passphrase) {
             Ok(key) => {
                 debug!("loaded SSH key: {} ({})", key.fingerprint, key.comment);
@@ -208,7 +199,6 @@ pub fn load_ssh_keys(dir: &Path, passphrase: &str) -> Vec<SshKey> {
             }
         }
     }
-
     keys
 }
 

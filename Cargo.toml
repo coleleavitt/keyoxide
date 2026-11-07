@@ -14,19 +14,23 @@ ssh-key = { version = "0.6", features = ["encryption", "ed25519", "rsa", "p256",
 signature = "2"
 
 # Cryptography
-rsa = { version = "0.9", features = ["sha2"] }
+rsa = { version = "0.9", features = ["sha2", "hazmat"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
-sha1 = "0.10"
+# "oid" for PKCS#1 v1.5 SHA-1 signatures (SSH "ssh-rsa")
+sha1 = { version = "0.10", features = ["oid"] }
 rand = "0.8"
 aes = "0.8"
 cbc = "0.1"
 ocb3 = "0.1"
+# Curve25519 ECDH for PKDECRYPT with cv25519 subkeys
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+# IMPORT_KEY: AES key wrap (RFC 3394) and OpenPGP CFB secret-key protection
+aes-kw = { version = "0.2", features = ["alloc"] }
+cfb-mode = "0.8"
 
-# GPG S-expression parsing
-lexpr = "0.2"
 
 # Security
 secrecy = { version = "0.10", features = ["serde"] }
