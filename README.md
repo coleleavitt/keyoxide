@@ -67,17 +67,68 @@ service; OpenRC handles startup, cleanup, and crash restarts, while
 export SSH_AUTH_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/keyoxide/ssh.sock"
 ```
 
-## Supported keys
+## What it supports
 
-- **SSH:** RSA (sha2-256/512), Ed25519, ECDSA P-256/P-384 (raw `r‖s` encoding).
-- **GPG:** RSA, Ed25519 (eddsa), ECDSA P-256/P-384 — signatures returned as the
-  correctly-tagged `sig-val` S-expression.
+- **SSH:** RSA (sha2-256/512), Ed25519, ECDSA P-256/P-384. Keys come from
+  `~/.ssh` at startup, so `ssh-add` add/remove requests are refused, and
+  extension requests such as OpenSSH's `session-bind@openssh.com` get
+  `SSH_AGENT_FAILURE` without dropping the connection.
+- **GPG keys:** RSA, Ed25519, Curve25519 (cv25519) and NIST P-256/P-384, from
+  `$GNUPGHOME/private-keys-v1.d` (the GnuPG home `gpgconf` reports). Both the
+  extended (`Key:`) and the older canonical key-file formats are read.
+- **Signing:** `PKSIGN` for every key type above.
+- **Decryption:** `PKDECRYPT` for RSA, and for ECDH both the classic form and
+  GnuPG 2.5's `--kem=PGP`, where the agent runs the RFC 6637 KDF and unwraps
+  the session key itself.
+- **Importing secret keys:** `gpg --import` works (`KEYWRAP_KEY` +
+  `IMPORT_KEY`). The key is protected with keyoxide's passphrase in GnuPG's
+  own format, so gpg-agent can read it too. A key under a different
+  passphrase imports with `gpg --pinentry-mode loopback --passphrase ...`.
+- **Generating keys:** `gpg --gen-key`, `--quick-gen-key` and
+  `--quick-add-key` (`GENKEY`) for Ed25519, Curve25519, NIST P-256/P-384 and
+  RSA 2048-8192. New keys are protected with keyoxide's passphrase; gpg
+  does not ask for one.
+- **Exporting secret keys:** `gpg --export-secret-keys` (`EXPORT_KEY
+  --openpgp`). The export is protected with keyoxide's passphrase, which you
+  need to import it elsewhere.
+- **`gpg --passwd`:** every keyoxide key shares its one passphrase, so this
+  re-protects a key under it. That also brings in a key that has another
+  passphrase: `gpg --pinentry-mode loopback --passphrase OLD --passwd KEY`.
+- **SSH `ssh-rsa`:** RSA requests without a SHA-2 flag get the SHA-1
+  signature the protocol defines for them.
+
+Not supported: smartcard keys, and `gpg --export-secret-keys
+--export-options mode1003`.
+
+## Changing the passphrase
+
+```sh
+keyoxide passwd
+rc-service --user keyoxide restart
+```
+
+`keyoxide passwd` asks for the new passphrase twice (or reads one line from
+stdin when it is not a terminal). It re-encrypts every GPG key file and
+every encrypted SSH key that the current passphrase opens, checks that each
+new copy opens with the new passphrase, and only then replaces the files and
+updates `~/.config/keyoxide/passphrase`. Keys under another passphrase, or
+with none, are listed and left alone. The originals are kept in
+`~/.local/state/keyoxide/passwd-backup-<time>/`; delete that directory once
+everything works, since it still opens with the old passphrase. Restart
+keyoxide afterwards so it reads the new passphrase.
 
 ## Tests
 
 ```sh
 cargo test
+cargo build --release && contrib/e2e.sh
 ```
+
+`contrib/e2e.sh` drives real GnuPG and OpenSSH against the built binary:
+signing, decryption and import for every key type, the SSH agent, and that
+gpg-agent can read the key files keyoxide writes. It runs in a throwaway home
+with its own sockets and no pinentry, so it never touches your keys or the
+running agent.
 
 ## Examples
 
