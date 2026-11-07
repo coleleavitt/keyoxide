@@ -42,7 +42,11 @@ impl Config {
             ssh_socket_path: socket_paths.ssh_socket_path,
             gpg_socket_path: socket_paths.gpg_socket_path,
             ssh_key_dir: home.join(".ssh"),
-            gpg_key_dir: home.join(".gnupg").join("private-keys-v1.d"),
+            // The key store belongs to the same GnuPG home as the socket, so a
+            // custom GNUPGHOME serves its own keys rather than ~/.gnupg's.
+            gpg_key_dir: gpgconf_dir("homedir")
+                .unwrap_or_else(|| home.join(".gnupg"))
+                .join("private-keys-v1.d"),
         })
     }
 
@@ -55,33 +59,13 @@ impl Config {
         // Modern gpg (2.1+) ignores GPG_AGENT_INFO and always connects
         // to the socket reported by `gpgconf --list-dirs agent-socket`,
         // which is typically ~/.gnupg/S.gpg-agent.
-        let gpg_socket_path = Self::gpg_agent_socket_path(&home);
+        let gpg_socket_path =
+            gpgconf_dir("agent-socket").unwrap_or_else(|| home.join(".gnupg").join("S.gpg-agent"));
 
         Ok(SocketPaths {
             ssh_socket_path: keyoxide_dir.join("ssh.sock"),
             gpg_socket_path,
         })
-    }
-
-    /// Determine where gpg expects to find the agent socket.
-    ///
-    /// Queries `gpgconf --list-dirs agent-socket` first; falls back to
-    /// `~/.gnupg/S.gpg-agent` if gpgconf isn't available.
-    fn gpg_agent_socket_path(home: &std::path::Path) -> PathBuf {
-        std::process::Command::new("gpgconf")
-            .args(["--list-dirs", "agent-socket"])
-            .output()
-            .ok()
-            .and_then(|out| {
-                if out.status.success() {
-                    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if !path.is_empty() {
-                        return Some(PathBuf::from(path));
-                    }
-                }
-                None
-            })
-            .unwrap_or_else(|| home.join(".gnupg").join("S.gpg-agent"))
     }
 
     fn load_passphrase() -> Result<SecretString> {
@@ -180,4 +164,16 @@ impl Config {
     pub fn passphrase(&self) -> &str {
         self.passphrase.expose_secret()
     }
+}
+
+/// Ask GnuPG where a directory or socket lives (`gpgconf --list-dirs NAME`),
+/// so keyoxide follows GNUPGHOME and GnuPG's socket-directory rules.
+fn gpgconf_dir(name: &str) -> Option<PathBuf> {
+    let out = std::process::Command::new("gpgconf")
+        .args(["--list-dirs", name])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }

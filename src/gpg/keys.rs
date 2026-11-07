@@ -7,18 +7,21 @@ use rsa::RsaPrivateKey;
 use rsa::pkcs1v15::SigningKey as RsaSigningKey;
 use rsa::signature::SignatureEncoding;
 use rsa::signature::hazmat::PrehashSigner;
-use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha384, Sha512};
-use tracing::{debug, info, warn};
+use sha2::{Sha256, Sha384, Sha512};
+use tracing::{info, warn};
 use zeroize::Zeroizing;
 
-use super::sexp::{CanonicalParser, parse_gpg_sexp};
+use super::curve::Curve;
+use super::keyfile::{KeyMaterial, read_key_file};
+use super::sexp::{SexpNode, parse_canonical, push_param};
 use crate::error::{Error, Result};
 
 #[derive(Clone)]
 pub enum GpgKeyType {
     Rsa(Box<RsaPrivateKey>),
     Ed25519(SigningKey),
+    /// Curve25519 ECDH (cv25519 encryption subkeys).
+    X25519(x25519_dalek::StaticSecret),
     EcdsaP256(P256SigningKey),
     EcdsaP384(P384SigningKey),
 }
@@ -39,53 +42,265 @@ pub enum GpgSignature {
     EdDsa { r: Vec<u8>, s: Vec<u8> },
 }
 
+impl GpgKeyType {
+    pub fn from_material(material: &KeyMaterial) -> Result<Self> {
+        if material.algo == "rsa" {
+            let int = |name: &'static str| {
+                material
+                    .get(name)
+                    .map(rsa::BigUint::from_bytes_be)
+                    .ok_or(Error::MissingField(name))
+            };
+            let key = RsaPrivateKey::from_components(
+                int("n")?,
+                int("e")?,
+                int("d")?,
+                vec![int("p")?, int("q")?],
+            )?;
+            return Ok(Self::Rsa(Box::new(key)));
+        }
+
+        let name = material
+            .curve
+            .as_deref()
+            .ok_or(Error::MissingField("curve"))?;
+        let curve = Curve::from_name(name)
+            .ok_or_else(|| Error::UnsupportedKeyType(format!("curve {name}")))?;
+        let d = material.get("d").ok_or(Error::MissingField("d"))?;
+        Ok(match curve {
+            Curve::Ed25519 => Self::Ed25519(SigningKey::from_bytes(&*fixed_be::<32>(d)?)),
+            // libgcrypt stores the X25519 scalar as a big-endian MPI, the
+            // reverse of the native little-endian encoding.
+            Curve::Curve25519 => Self::X25519(x25519_secret(d, material.get("q"))?),
+            Curve::NistP256 => Self::EcdsaP256(
+                P256SigningKey::from_slice(&*fixed_be::<32>(d)?).map_err(|_| Error::Ecdsa)?,
+            ),
+            Curve::NistP384 => Self::EcdsaP384(
+                P384SigningKey::from_slice(&*fixed_be::<48>(d)?).map_err(|_| Error::Ecdsa)?,
+            ),
+        })
+    }
+}
+
+/// The X25519 secret, checked against the stored public point when one is
+/// present. libgcrypt keeps the scalar as a big-endian MPI, the reverse of
+/// the native little-endian encoding.
+fn x25519_secret(d: &[u8], q: Option<&[u8]>) -> Result<x25519_dalek::StaticSecret> {
+    let mut native = fixed_be::<32>(d)?;
+    native.reverse();
+    let secret = x25519_dalek::StaticSecret::from(*native);
+    if let Some(q) = q {
+        let public = x25519_dalek::PublicKey::from(&secret);
+        if q.strip_prefix(&[0x40]).unwrap_or(q) != public.as_bytes() {
+            return Err(Error::UnsupportedKeyType(
+                "Curve25519 secret does not match its public key".into(),
+            ));
+        }
+    }
+    Ok(secret)
+}
+
+/// A big-endian value as exactly `N` bytes: leading zero bytes dropped
+/// (MPIs may carry a sign byte) and short values left-padded.
+fn fixed_be<const N: usize>(value: &[u8]) -> Result<Zeroizing<[u8; N]>> {
+    let start = value.iter().position(|&b| b != 0).unwrap_or(value.len());
+    let digits = &value[start..];
+    if digits.len() > N {
+        return Err(Error::InvalidMessageFormat);
+    }
+    let mut out = Zeroizing::new([0u8; N]);
+    out[N - digits.len()..].copy_from_slice(digits);
+    Ok(out)
+}
+
 impl GpgKey {
     pub fn sign(&self, hash: &[u8], algo: u32) -> Result<GpgSignature> {
         match &self.key_type {
             GpgKeyType::Rsa(key) => sign_rsa(key, hash, algo),
-            GpgKeyType::Ed25519(key) => sign_ed25519(key, hash),
+            GpgKeyType::Ed25519(key) => Ok(sign_ed25519(key, hash)),
             GpgKeyType::EcdsaP256(key) => sign_ecdsa_p256(key, hash),
             GpgKeyType::EcdsaP384(key) => sign_ecdsa_p384(key, hash),
+            GpgKeyType::X25519(_) => Err(Error::UnsupportedAlgorithm(
+                "Curve25519 keys only decrypt".into(),
+            )),
         }
     }
+
+    /// Answer a classic PKDECRYPT: given gpg's `(enc-val ...)`, return the
+    /// `(5:value...)` gpg-agent sends back. For RSA that is the raw PKCS#1
+    /// block (gpg removes the padding); for ECDH it is the shared point
+    /// (gpg runs the KDF and unwraps the session key).
+    pub fn decrypt(&self, enc_val: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        let root = parse_canonical(enc_val)?;
+        let params = enc_val_params(&root, &[b"rsa", b"ecdh", b"elg"])?;
+        let value = match &self.key_type {
+            GpgKeyType::Rsa(key) => {
+                let c = rsa::BigUint::from_bytes_be(param(params, "a")?);
+                let m = rsa::hazmat::rsa_decrypt_and_check(
+                    key.as_ref(),
+                    Some(&mut rand::rngs::OsRng),
+                    &c,
+                )?;
+                Zeroizing::new(m.to_bytes_be())
+            }
+            _ => self.ecdh_point(param(params, "e")?)?,
+        };
+        Ok(value_sexp(&value))
+    }
+
+    /// Answer `PKDECRYPT --kem=PGP` (GnuPG 2.5): the agent does the whole
+    /// OpenPGP ECDH step (RFC 6637) and returns the unwrapped session key,
+    /// as `ecc_kem_decrypt` in gpg-agent's `pkdecrypt.c`.
+    pub fn kem_decrypt_pgp(&self, enc_val: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        let root = parse_canonical(enc_val)?;
+        let params = enc_val_params(&root, &[b"ecc"])?;
+        let number = |name: &'static str| -> Result<u32> {
+            std::str::from_utf8(param(params, name)?)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or(Error::InvalidMessageFormat)
+        };
+        let point = self.ecdh_point(param(params, "e")?)?;
+        // Z: the X25519 output, or a NIST point's x-coordinate.
+        let z = match point.split_first() {
+            Some((0x40, rest)) => rest,
+            Some((0x04, rest)) => &rest[..rest.len() / 2],
+            _ => return Err(Error::InvalidMessageFormat),
+        };
+
+        let kek_len = match number("c")? {
+            7 => 16,
+            8 => 24,
+            9 => 32,
+            other => return Err(Error::UnsupportedAlgorithm(format!("KEK cipher {other}"))),
+        };
+        let kdf_params = param(params, "kdf-params")?;
+        let kek = match number("h")? {
+            8 => one_step_kdf::<Sha256>(z, kdf_params, kek_len),
+            9 => one_step_kdf::<Sha384>(z, kdf_params, kek_len),
+            10 => one_step_kdf::<Sha512>(z, kdf_params, kek_len),
+            other => return Err(Error::UnsupportedAlgorithm(format!("KDF hash {other}"))),
+        };
+
+        // `s` is a length octet followed by the AES-wrapped session key.
+        let wrapped = param(params, "s")?;
+        let (&len, wrapped) = wrapped.split_first().ok_or(Error::InvalidMessageFormat)?;
+        if usize::from(len) != wrapped.len() {
+            return Err(Error::InvalidMessageFormat);
+        }
+        let unwrapped = match kek_len {
+            16 => aes_kw::KekAes128::from(<[u8; 16]>::try_from(&kek[..]).expect("16-byte KEK"))
+                .unwrap_vec(wrapped),
+            24 => aes_kw::KekAes192::from(<[u8; 24]>::try_from(&kek[..]).expect("24-byte KEK"))
+                .unwrap_vec(wrapped),
+            _ => aes_kw::KekAes256::from(<[u8; 32]>::try_from(&kek[..]).expect("32-byte KEK"))
+                .unwrap_vec(wrapped),
+        }
+        .map_err(|_| Error::KeyDecryptionFailed)?;
+        Ok(value_sexp(&Zeroizing::new(unwrapped)))
+    }
+
+    /// ECDH with the ephemeral point `e`, in the agent's point format:
+    /// `0x40 || x` for Curve25519, `0x04 || X || Y` for NIST curves.
+    fn ecdh_point(&self, e: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        Ok(match &self.key_type {
+            GpgKeyType::X25519(secret) => {
+                let point: [u8; 32] = e
+                    .strip_prefix(&[0x40])
+                    .unwrap_or(e)
+                    .try_into()
+                    .map_err(|_| Error::InvalidMessageFormat)?;
+                let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(point));
+                if !shared.was_contributory() {
+                    return Err(Error::InvalidMessageFormat);
+                }
+                Zeroizing::new([&[0x40][..], shared.as_bytes()].concat())
+            }
+            GpgKeyType::EcdsaP256(key) => {
+                use p256::elliptic_curve::sec1::ToEncodedPoint;
+                let point = p256::PublicKey::from_sec1_bytes(e).map_err(|_| Error::Ecdsa)?;
+                let shared = (point.to_projective() * **key.as_nonzero_scalar()).to_affine();
+                Zeroizing::new(shared.to_encoded_point(false).as_bytes().to_vec())
+            }
+            GpgKeyType::EcdsaP384(key) => {
+                use p384::elliptic_curve::sec1::ToEncodedPoint;
+                let point = p384::PublicKey::from_sec1_bytes(e).map_err(|_| Error::Ecdsa)?;
+                let shared = (point.to_projective() * **key.as_nonzero_scalar()).to_affine();
+                Zeroizing::new(shared.to_encoded_point(false).as_bytes().to_vec())
+            }
+            GpgKeyType::Rsa(_) | GpgKeyType::Ed25519(_) => {
+                return Err(Error::UnsupportedAlgorithm("not an ECDH key".into()));
+            }
+        })
+    }
+}
+
+/// The algorithm list inside `(enc-val ... (ALGO (NAME VALUE)...))`.
+fn enc_val_params<'a>(root: &'a SexpNode, algos: &[&[u8]]) -> Result<&'a [SexpNode]> {
+    if root.name() != Some(b"enc-val") {
+        return Err(Error::SexpParse("expected enc-val".into()));
+    }
+    root.as_list()
+        .unwrap_or_default()
+        .iter()
+        .skip(1)
+        .find(|item| item.name().is_some_and(|name| algos.contains(&name)))
+        .and_then(SexpNode::as_list)
+        .ok_or_else(|| Error::SexpParse("unsupported enc-val algorithm".into()))
+}
+
+fn param<'a>(params: &'a [SexpNode], name: &'static str) -> Result<&'a [u8]> {
+    params
+        .iter()
+        .find(|item| item.name() == Some(name.as_bytes()))
+        .and_then(|item| item.as_list()?.get(1)?.as_atom())
+        .ok_or(Error::MissingField(name))
+}
+
+fn value_sexp(value: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(value.len() + 16));
+    push_param(&mut out, b"value", value);
+    out
+}
+
+/// NIST SP 800-56C one-step KDF as OpenPGP ECDH uses it (RFC 6637
+/// section 7): `Hash(counter || Z || params)` with a 32-bit big-endian
+/// counter from 1, concatenated until `len` bytes.
+fn one_step_kdf<D: sha2::Digest>(z: &[u8], params: &[u8], len: usize) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(len));
+    let mut counter = 1u32;
+    while out.len() < len {
+        let mut hasher = D::new();
+        hasher.update(counter.to_be_bytes());
+        hasher.update(z);
+        hasher.update(params);
+        let digest = hasher.finalize();
+        let take = (len - out.len()).min(digest.len());
+        out.extend_from_slice(&digest[..take]);
+        counter += 1;
+    }
+    out
 }
 
 fn sign_rsa(key: &RsaPrivateKey, hash: &[u8], algo: u32) -> Result<GpgSignature> {
-    match algo {
-        8 => {
-            let signing_key = RsaSigningKey::<Sha256>::new(key.clone());
-            let sig = signing_key
-                .sign_prehash(hash)
-                .map_err(|_| Error::SigningFailed)?;
-            Ok(GpgSignature::Rsa(sig.to_vec()))
-        }
-        9 => {
-            let signing_key = RsaSigningKey::<Sha384>::new(key.clone());
-            let sig = signing_key
-                .sign_prehash(hash)
-                .map_err(|_| Error::SigningFailed)?;
-            Ok(GpgSignature::Rsa(sig.to_vec()))
-        }
-        10 => {
-            let signing_key = RsaSigningKey::<Sha512>::new(key.clone());
-            let sig = signing_key
-                .sign_prehash(hash)
-                .map_err(|_| Error::SigningFailed)?;
-            Ok(GpgSignature::Rsa(sig.to_vec()))
-        }
-        _ => Err(Error::UnsupportedAlgorithm(format!("hash algo {}", algo))),
+    let sig = match algo {
+        8 => RsaSigningKey::<Sha256>::new(key.clone()).sign_prehash(hash),
+        9 => RsaSigningKey::<Sha384>::new(key.clone()).sign_prehash(hash),
+        10 => RsaSigningKey::<Sha512>::new(key.clone()).sign_prehash(hash),
+        _ => return Err(Error::UnsupportedAlgorithm(format!("hash algo {algo}"))),
     }
+    .map_err(|_| Error::SigningFailed)?;
+    Ok(GpgSignature::Rsa(sig.to_vec()))
 }
 
-fn sign_ed25519(key: &SigningKey, data: &[u8]) -> Result<GpgSignature> {
-    let sig = key.sign(data);
+fn sign_ed25519(key: &SigningKey, data: &[u8]) -> GpgSignature {
     // Ed25519 signature is R (32 bytes) || S (32 bytes); gpg's eddsa sig-val
     // wants them as two separate MPIs.
-    let bytes = sig.to_bytes();
-    Ok(GpgSignature::EdDsa {
+    let bytes = key.sign(data).to_bytes();
+    GpgSignature::EdDsa {
         r: bytes[..32].to_vec(),
         s: bytes[32..].to_vec(),
-    })
+    }
 }
 
 fn sign_ecdsa_p256(key: &P256SigningKey, hash: &[u8]) -> Result<GpgSignature> {
@@ -121,482 +336,96 @@ pub fn load_gpg_keys(dir: &Path, passphrase: &str) -> Vec<GpgKey> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-
         if path.extension().is_none_or(|extension| extension != "key") {
             continue;
         }
-
         let keygrip = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_uppercase();
-
-        if keygrip.len() != 40 {
+        if keygrip.len() != 40 || !keygrip.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
         }
 
-        match load_single_gpg_key(&path, passphrase) {
+        match read_key_file(&path, passphrase).and_then(|m| GpgKeyType::from_material(&m)) {
             Ok(key_type) => {
                 info!("loaded GPG key: {}", keygrip);
                 keys.push(GpgKey { keygrip, key_type });
             }
-            Err(e) => {
-                warn!("skipping GPG key {:?}: {}", path, e);
-            }
+            Err(e) => warn!("skipping GPG key {:?}: {}", path, e),
         }
     }
 
     keys
 }
 
-fn load_single_gpg_key(path: &Path, passphrase: &str) -> Result<GpgKeyType> {
-    let content = Zeroizing::new(std::fs::read_to_string(path)?);
-    parse_gpg_key_sexp(&content, passphrase)
-}
-
-fn parse_gpg_key_sexp(content: &str, passphrase: &str) -> Result<GpgKeyType> {
-    let content = content.trim();
-
-    if content.contains("(protected-private-key") && content.contains("(protected ") {
-        return parse_protected_key(content, passphrase);
-    }
-
-    if content.contains("(private-key") || content.contains("(shadowed-private-key") {
-        return parse_unprotected_key(content);
-    }
-
-    Err(Error::UnsupportedKeyType("unknown GPG key format".into()))
-}
-
-fn parse_unprotected_key(content: &str) -> Result<GpgKeyType> {
-    if content.contains("(rsa") {
-        return parse_rsa_key(content);
-    }
-
-    if content.contains("(ecc") || content.contains("(ecdsa") {
-        if content.contains("Ed25519") || content.contains("ed25519") {
-            return parse_ed25519_key(content);
-        } else if content.contains("nistp256") || content.contains("NIST P-256") {
-            return parse_ecdsa_p256_key(content);
-        } else if content.contains("nistp384") || content.contains("NIST P-384") {
-            return parse_ecdsa_p384_key(content);
-        }
-    }
-
-    Err(Error::UnsupportedKeyType(
-        "unrecognized unprotected key type".into(),
-    ))
-}
-
-struct ProtectedKeyParams {
-    salt: [u8; 8],
-    s2k_count: u64,
-    nonce: Vec<u8>,
-    ciphertext: Vec<u8>,
-    is_ocb: bool,
-}
-
-fn parse_protected_key(content: &str, passphrase: &str) -> Result<GpgKeyType> {
-    let sexp_start = content
-        .find("(protected-private-key")
-        .or_else(|| content.find("(private-key"))
-        .ok_or(Error::SexpParse("no S-expression found".into()))?;
-    let sexp_content = &content[sexp_start..];
-
-    let sexp = parse_gpg_sexp(sexp_content)?;
-    let canonical = sexp.to_canonical();
-
-    let (params, aad1, aad2) = extract_canonical_params(&canonical)?;
-
-    debug!(
-        "salt={} s2k={} nonce={} ct_len={} is_ocb={}",
-        hex::encode(params.salt),
-        params.s2k_count,
-        hex::encode(&params.nonce),
-        params.ciphertext.len(),
-        params.is_ocb
-    );
-
-    let key = derive_s2k_key(passphrase, &params.salt, params.s2k_count, 16);
-
-    let decrypted = if params.is_ocb {
-        decrypt_ocb(&key, &params.nonce, &aad1, &aad2, &params.ciphertext)?
-    } else {
-        decrypt_cbc(&key, &params.nonce, &params.ciphertext)?
-    };
-
-    debug!("decrypted {} bytes", decrypted.len());
-    parse_decrypted_private_key(&decrypted, content)
-}
-
-fn extract_canonical_params(canonical: &[u8]) -> Result<(ProtectedKeyParams, Vec<u8>, Vec<u8>)> {
-    let mut parser = CanonicalParser::new(canonical);
-
-    parser.expect_list_start()?;
-    let outer_name = parser.read_atom()?;
-    if outer_name != b"protected-private-key" {
-        return Err(Error::SexpParse("expected protected-private-key".into()));
-    }
-
-    let aad_begin = parser.position();
-
-    parser.expect_list_start()?;
-    let _algo = parser.read_atom()?;
-
-    let mut hole_begin = 0;
-    let mut hole_end = 0;
-    let mut params = None;
-
-    while !parser.peek_is_list_end() {
-        let item_start = parser.position();
-
-        if parser.peek_is_list() {
-            parser.expect_list_start()?;
-
-            if !parser.peek_is_list_end() && !parser.peek_is_list() {
-                let name = parser.read_atom()?;
-
-                if name == b"protected" {
-                    hole_begin = item_start;
-
-                    let method = parser.read_atom()?;
-                    let is_ocb = method == b"openpgp-s2k3-ocb-aes";
-
-                    parser.expect_list_start()?;
-                    parser.expect_list_start()?;
-                    let hash_type = parser.read_atom()?;
-                    if hash_type != b"sha1" {
-                        return Err(Error::SexpParse("expected sha1".into()));
-                    }
-
-                    let salt_data = parser.read_atom()?;
-                    if salt_data.len() != 8 {
-                        return Err(Error::SexpParse("expected 8-byte salt".into()));
-                    }
-                    let mut salt = [0u8; 8];
-                    salt.copy_from_slice(salt_data);
-
-                    let count_str = parser.read_atom()?;
-                    let count_str = std::str::from_utf8(count_str)
-                        .map_err(|_| Error::SexpParse("invalid count string".into()))?;
-                    let s2k_count: u64 = count_str
-                        .parse()
-                        .map_err(|_| Error::SexpParse("invalid count".into()))?;
-
-                    parser.expect_list_end()?;
-
-                    let nonce = parser.read_atom()?.to_vec();
-                    parser.expect_list_end()?;
-
-                    let ciphertext = parser.read_atom()?.to_vec();
-
-                    params = Some(ProtectedKeyParams {
-                        salt,
-                        s2k_count,
-                        nonce,
-                        ciphertext,
-                        is_ocb,
-                    });
-                }
-            }
-
-            while !parser.peek_is_list_end() {
-                parser.skip_sexp()?;
-            }
-            parser.expect_list_end()?;
-
-            if hole_begin == item_start {
-                hole_end = parser.position();
-            }
-        } else {
-            parser.skip_sexp()?;
-        }
-    }
-
-    parser.expect_list_end()?;
-    let aad_end = parser.position();
-
-    let params = params.ok_or(Error::SexpParse("no protected section found".into()))?;
-
-    let aad1 = canonical[aad_begin..hole_begin].to_vec();
-    let aad2 = canonical[hole_end..aad_end].to_vec();
-
-    debug!(
-        "AAD: part1={} bytes, hole={} bytes, part2={} bytes",
-        aad1.len(),
-        hole_end - hole_begin,
-        aad2.len()
-    );
-
-    Ok((params, aad1, aad2))
-}
-
-fn derive_s2k_key(
-    passphrase: &str,
-    salt: &[u8; 8],
-    count: u64,
-    key_len: usize,
-) -> Zeroizing<Vec<u8>> {
-    let mut result = Zeroizing::new(vec![0u8; key_len]);
-    let pass_bytes = passphrase.as_bytes();
-
-    let salted_len = salt.len() + pass_bytes.len();
-    let mut salted = vec![0u8; salted_len];
-    salted[..8].copy_from_slice(salt);
-    salted[8..].copy_from_slice(pass_bytes);
-
-    let total_bytes = count.max(salted_len as u64) as usize;
-
-    let mut prefix_byte = 0u8;
-    let mut key_offset = 0;
-
-    while key_offset < key_len {
-        let mut hasher = Sha1::new();
-
-        for _ in 0..prefix_byte {
-            hasher.update([0u8]);
-        }
-
-        let mut hashed = 0;
-        while hashed < total_bytes {
-            let chunk_len = salted_len.min(total_bytes - hashed);
-            hasher.update(&salted[..chunk_len]);
-            hashed += chunk_len;
-        }
-
-        let digest = hasher.finalize();
-        let copy_len = (key_len - key_offset).min(digest.len());
-        result[key_offset..key_offset + copy_len].copy_from_slice(&digest[..copy_len]);
-        key_offset += copy_len;
-        prefix_byte += 1;
-    }
-
-    result
-}
-
-#[allow(deprecated)]
-fn decrypt_ocb(
-    key: &[u8],
-    nonce: &[u8],
-    aad1: &[u8],
-    aad2: &[u8],
-    ciphertext: &[u8],
-) -> Result<Vec<u8>> {
-    use aes::Aes128;
-
-    if ciphertext.len() < 16 {
-        return Err(Error::KeyDecryptionFailed);
-    }
-
-    let tag_start = ciphertext.len() - 16;
-    let ct_data = &ciphertext[..tag_start];
-    let tag = &ciphertext[tag_start..];
-
-    let mut aad_combined = Vec::with_capacity(aad1.len() + aad2.len());
-    aad_combined.extend_from_slice(aad1);
-    aad_combined.extend_from_slice(aad2);
-
-    {
-        use ocb3::Ocb3;
-        use ocb3::aead::generic_array::GenericArray;
-        use ocb3::aead::{AeadInPlace, KeyInit};
-
-        let key_arr: &GenericArray<u8, _> = GenericArray::from_slice(key);
-        let ocb: Ocb3<Aes128> = Ocb3::new(key_arr);
-
-        let mut buffer = ct_data.to_vec();
-        let nonce_arr = GenericArray::from_slice(nonce);
-        let tag_arr = GenericArray::from_slice(tag);
-
-        ocb.decrypt_in_place_detached(nonce_arr, &aad_combined, &mut buffer, tag_arr)
-            .map_err(|_| Error::KeyDecryptionFailed)?;
-
-        Ok(buffer)
-    }
-}
-
-fn decrypt_cbc(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-    use aes::Aes128;
-    use aes::cipher::{BlockDecryptMut, KeyIvInit};
-    use cbc::Decryptor;
-
-    type Aes128CbcDec = Decryptor<Aes128>;
-
-    let cipher = Aes128CbcDec::new_from_slices(key, iv).map_err(|_| Error::KeyDecryptionFailed)?;
-
-    let mut buffer = ciphertext.to_vec();
-    let decrypted = cipher
-        .decrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buffer)
-        .map_err(|_| Error::KeyDecryptionFailed)?;
-
-    Ok(decrypted.to_vec())
-}
-
-fn parse_decrypted_private_key(decrypted: &[u8], original: &str) -> Result<GpgKeyType> {
-    if original.contains("(rsa") {
-        parse_rsa_from_canonical(original, decrypted)
-    } else if original.contains("(ecc") || original.contains("(ecdsa") {
-        parse_ecc_from_canonical(original, decrypted)
-    } else {
-        Err(Error::UnsupportedKeyType(
-            "unknown protected key algorithm".into(),
-        ))
-    }
-}
-
-fn extract_canonical_mpis(decrypted: &[u8]) -> Result<std::collections::HashMap<String, Vec<u8>>> {
-    let mut mpis = std::collections::HashMap::new();
-    let mut parser = CanonicalParser::new(decrypted);
-
-    parser.expect_list_start()?;
-    parser.expect_list_start()?;
-
-    while !parser.peek_is_list_end() {
-        parser.expect_list_start()?;
-        let name = parser.read_atom()?;
-        let value = parser.read_atom()?;
-        mpis.insert(String::from_utf8_lossy(name).to_string(), value.to_vec());
-        parser.expect_list_end()?;
-    }
-
-    Ok(mpis)
-}
-
-fn parse_rsa_from_canonical(original: &str, decrypted: &[u8]) -> Result<GpgKeyType> {
-    let n = extract_mpi(original, "n")?;
-    let e = extract_mpi(original, "e")?;
-
-    let mpis = extract_canonical_mpis(decrypted)?;
-    let d = mpis.get("d").ok_or(Error::MissingField("d"))?;
-    let p = mpis.get("p").ok_or(Error::MissingField("p"))?;
-    let q = mpis.get("q").ok_or(Error::MissingField("q"))?;
-
-    let n_int = rsa::BigUint::from_bytes_be(&n);
-    let e_int = rsa::BigUint::from_bytes_be(&e);
-    let d_int = rsa::BigUint::from_bytes_be(d);
-    let p_int = rsa::BigUint::from_bytes_be(p);
-    let q_int = rsa::BigUint::from_bytes_be(q);
-
-    let primes = vec![p_int, q_int];
-    let key = RsaPrivateKey::from_components(n_int, e_int, d_int, primes)?;
-
-    Ok(GpgKeyType::Rsa(Box::new(key)))
-}
-
-fn parse_ecc_from_canonical(original: &str, decrypted: &[u8]) -> Result<GpgKeyType> {
-    let mpis = extract_canonical_mpis(decrypted)?;
-    let d = mpis.get("d").ok_or(Error::MissingField("d"))?;
-
-    if original.contains("Ed25519") || original.contains("ed25519") {
-        let seed: [u8; 32] = d
-            .get(d.len().saturating_sub(32)..)
-            .unwrap_or(d)
-            .try_into()
-            .map_err(|_| Error::InvalidMessageFormat)?;
-        let key = SigningKey::from_bytes(&seed);
-        Ok(GpgKeyType::Ed25519(key))
-    } else if original.contains("nistp256") || original.contains("NIST P-256") {
-        let key = P256SigningKey::from_slice(d).map_err(|_| Error::Ecdsa)?;
-        Ok(GpgKeyType::EcdsaP256(key))
-    } else if original.contains("nistp384") || original.contains("NIST P-384") {
-        let key = P384SigningKey::from_slice(d).map_err(|_| Error::Ecdsa)?;
-        Ok(GpgKeyType::EcdsaP384(key))
-    } else {
-        Err(Error::UnsupportedKeyType("unknown ECC curve".into()))
-    }
-}
-
-fn parse_rsa_key(content: &str) -> Result<GpgKeyType> {
-    let n = extract_mpi(content, "n")?;
-    let e = extract_mpi(content, "e")?;
-    let d = extract_mpi(content, "d")?;
-    let p = extract_mpi(content, "p")?;
-    let q = extract_mpi(content, "q")?;
-
-    let n_int = rsa::BigUint::from_bytes_be(&n);
-    let e_int = rsa::BigUint::from_bytes_be(&e);
-    let d_int = rsa::BigUint::from_bytes_be(&d);
-    let p_int = rsa::BigUint::from_bytes_be(&p);
-    let q_int = rsa::BigUint::from_bytes_be(&q);
-
-    let primes = vec![p_int, q_int];
-    let key = RsaPrivateKey::from_components(n_int, e_int, d_int, primes)?;
-
-    Ok(GpgKeyType::Rsa(Box::new(key)))
-}
-
-fn parse_ed25519_key(content: &str) -> Result<GpgKeyType> {
-    let d = extract_mpi(content, "d")?;
-
-    let seed: [u8; 32] = d
-        .get(d.len().saturating_sub(32)..)
-        .unwrap_or(&d)
-        .try_into()
-        .map_err(|_| Error::InvalidMessageFormat)?;
-
-    let key = SigningKey::from_bytes(&seed);
-    Ok(GpgKeyType::Ed25519(key))
-}
-
-fn parse_ecdsa_p256_key(content: &str) -> Result<GpgKeyType> {
-    let d = extract_mpi(content, "d")?;
-
-    let key = P256SigningKey::from_slice(&d).map_err(|_| Error::Ecdsa)?;
-    Ok(GpgKeyType::EcdsaP256(key))
-}
-
-fn parse_ecdsa_p384_key(content: &str) -> Result<GpgKeyType> {
-    let d = extract_mpi(content, "d")?;
-
-    let key = P384SigningKey::from_slice(&d).map_err(|_| Error::Ecdsa)?;
-    Ok(GpgKeyType::EcdsaP384(key))
-}
-
-fn extract_mpi(content: &str, name: &'static str) -> Result<Vec<u8>> {
-    let pattern = format!("({} #", name);
-    let start = content.find(&pattern).ok_or(Error::MissingField(name))?;
-
-    let hex_start = start + pattern.len();
-    let hex_end = content[hex_start..]
-        .find('#')
-        .ok_or(Error::InvalidMessageFormat)?;
-
-    let hex_str: String = content[hex_start..hex_start + hex_end]
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-
-    hex::decode(&hex_str).map_err(Error::HexDecode)
-}
-
 #[cfg(test)]
 mod tests {
-    use tracing_test::traced_test;
-
     use super::*;
 
-    const JUNK_PROTECTED_RSA: &str = r#"
-(protected-private-key
-  (rsa
-    (n #01#)
-    (e #010001#)
-    (protected openpgp-s2k3-sha1-aes-cbc
-      ((sha1 #0001020304050607# "1")
-       #00000000000000000000000000000000#)
-      #00000000000000000000000000000000#)))
-"#;
+    #[test]
+    fn fixed_be_strips_sign_bytes_and_pads() {
+        assert_eq!(*fixed_be::<4>(&[0, 0, 1, 2]).unwrap(), [0, 0, 1, 2]);
+        assert_eq!(
+            *fixed_be::<4>(&[0, 0xAA, 1, 2, 3]).unwrap(),
+            [0xAA, 1, 2, 3]
+        );
+        assert_eq!(*fixed_be::<4>(&[7]).unwrap(), [0, 0, 0, 7]);
+        assert!(fixed_be::<2>(&[1, 2, 3]).is_err());
+    }
 
     #[test]
-    #[traced_test]
-    fn protected_key_debug_logs_never_expose_derived_key_material() {
-        const PASSPHRASE: &str = "sentinel-passphrase";
-        const SALT: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+    fn x25519_secret_must_match_its_public_key() {
+        let d = [0x11u8; 32];
+        let wrong_q = [&[0x40][..], &[0u8; 32]].concat();
+        assert!(x25519_secret(&d, Some(&wrong_q)).is_err());
+        let mut native = d;
+        native.reverse();
+        let right = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(native));
+        let right_q = [&[0x40][..], right.as_bytes()].concat();
+        assert!(x25519_secret(&d, Some(&right_q)).is_ok());
+    }
 
-        let leaked = hex::encode(&*derive_s2k_key(PASSPHRASE, &SALT, 1, 16));
-        let _ = parse_protected_key(JUNK_PROTECTED_RSA, PASSPHRASE);
+    #[test]
+    fn one_step_kdf_matches_rfc6637_construction() {
+        use sha2::Digest;
+        let expected = Sha256::digest([&[0, 0, 0, 1][..], b"Z", b"P"].concat());
+        assert_eq!(*one_step_kdf::<Sha256>(b"Z", b"P", 16), expected[..16]);
+    }
 
-        assert!(!logs_contain("derived key:"));
-        assert!(!logs_contain(&leaked));
+    #[test]
+    fn x25519_decrypt_returns_prefixed_shared_point() {
+        let our_native = [0x11u8; 32];
+        let mut stored = our_native;
+        stored.reverse();
+        let material = KeyMaterial {
+            algo: "ecc".into(),
+            curve: Some("Curve25519".into()),
+            flags: vec!["djb-tweak".into()],
+            params: vec![("d".into(), Zeroizing::new(stored.to_vec()))],
+        };
+        let key = GpgKey {
+            keygrip: "A".repeat(40),
+            key_type: GpgKeyType::from_material(&material).unwrap(),
+        };
+        let ephemeral = x25519_dalek::StaticSecret::from([0x22u8; 32]);
+        let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral);
+        let ours_pub = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(our_native));
+
+        let mut enc = b"(7:enc-val(4:ecdh(1:s2:\x01\x02)".to_vec();
+        push_param(
+            &mut enc,
+            b"e",
+            &[&[0x40][..], ephemeral_pub.as_bytes()].concat(),
+        );
+        enc.extend_from_slice(b"))");
+
+        let out = key.decrypt(&enc).unwrap();
+        let expected = ephemeral.diffie_hellman(&ours_pub);
+        let mut want = b"(5:value33:\x40".to_vec();
+        want.extend_from_slice(expected.as_bytes());
+        want.push(b')');
+        assert_eq!(*out, want);
     }
 }

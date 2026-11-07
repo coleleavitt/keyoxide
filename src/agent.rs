@@ -1,4 +1,7 @@
+use std::path::PathBuf;
+
 use parking_lot::RwLock;
+use secrecy::SecretString;
 
 use crate::gpg::keys::GpgKey;
 use crate::ssh::keys::SshKey;
@@ -6,6 +9,14 @@ use crate::ssh::keys::SshKey;
 pub struct AgentState {
     pub ssh_keys: RwLock<Vec<SshKey>>,
     pub gpg_keys: RwLock<Vec<GpgKey>>,
+    /// Where imported GPG keys are written, and the passphrase they are
+    /// protected with. `None` disables IMPORT_KEY.
+    pub gpg_store: Option<GpgStore>,
+}
+
+pub struct GpgStore {
+    pub dir: PathBuf,
+    pub passphrase: SecretString,
 }
 
 impl AgentState {
@@ -13,6 +24,7 @@ impl AgentState {
         Self {
             ssh_keys: RwLock::new(Vec::new()),
             gpg_keys: RwLock::new(Vec::new()),
+            gpg_store: None,
         }
     }
 

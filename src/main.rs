@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use keyoxide::agent::AgentState;
+use keyoxide::agent::{AgentState, GpgStore};
 use keyoxide::cli::{Command, HELP, parse_args};
 use keyoxide::config::{Config, SocketPaths};
 use keyoxide::error::{Error, Result};
@@ -9,6 +9,7 @@ use keyoxide::gpg::keys::load_gpg_keys;
 use keyoxide::health::{check_agent, gpg_is_keyoxide};
 use keyoxide::socket::{AgentSockets, SocketState, probe_socket};
 use keyoxide::ssh::keys::load_ssh_keys;
+use secrecy::SecretString;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -29,6 +30,13 @@ async fn main() {
         }
         Command::Version => {
             println!("keyoxide {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Command::Passwd => {
+            if let Err(error) = keyoxide::passwd::run() {
+                eprintln!("keyoxide: {error}");
+                std::process::exit(1);
+            }
             return;
         }
         Command::Check | Command::Run { .. } => {}
@@ -53,7 +61,9 @@ async fn execute(command: Command) -> Result<()> {
             Ok(())
         }
         Command::Run { replace } => run_agent(paths, replace).await,
-        Command::Help | Command::Version => unreachable!("handled before runtime setup"),
+        Command::Help | Command::Version | Command::Passwd => {
+            unreachable!("handled before runtime setup")
+        }
     }
 }
 
@@ -63,7 +73,12 @@ async fn run_agent(paths: SocketPaths, replace: bool) -> Result<()> {
     }
 
     let config = Config::load_with_socket_paths(paths.clone())?;
-    let state = Arc::new(AgentState::new());
+    let mut state = AgentState::new();
+    state.gpg_store = Some(GpgStore {
+        dir: config.gpg_key_dir.clone(),
+        passphrase: SecretString::from(config.passphrase().to_owned()),
+    });
+    let state = Arc::new(state);
 
     let ssh_keys = load_ssh_keys(&config.ssh_key_dir, config.passphrase());
     info!("loaded {} SSH keys", ssh_keys.len());
