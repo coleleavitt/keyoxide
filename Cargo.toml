@@ -13,7 +13,10 @@ tokio = { version = "1", features = ["full"] }
 ssh-key = { version = "0.6", features = ["encryption", "ed25519", "rsa", "p256", "p384"] }
 signature = "2"
 
-# Cryptography
+# Cryptography. Stays on the RustCrypto generation that rsa 0.9 and
+# ssh-key 0.6 use (sha2 0.10, p256 0.13, ed25519-dalek 2, signature 2):
+# rsa 0.10 and ssh-key 0.7 are still release candidates. Move the whole
+# set together once both are stable.
 rsa = { version = "0.9", features = ["sha2", "hazmat"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
@@ -45,10 +48,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utilities
 hex = "0.4"
-base64 = "0.22"
-dirs = "6"
+base64 = "0.23"
+dirs = "7"
 bytes = "1"
-parking_lot = "0.12"
+parking_lot = "0.13"
 libc = "0.2"
 
 [dev-dependencies]
