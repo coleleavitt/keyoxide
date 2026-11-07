@@ -27,6 +27,38 @@ pub enum Command {
         hash: Vec<u8>,
     },
     PkSign,
+    /// Decrypt a session key; the ciphertext arrives via INQUIRE CIPHERTEXT.
+    /// `kem` is the `--kem` option (`--kem` alone means `PQC-PGP`).
+    PkDecrypt {
+        kem: Option<String>,
+    },
+    /// Hand out a fresh key-wrapping key for IMPORT_KEY (`--import`) or
+    /// EXPORT_KEY (`--export`).
+    KeywrapKey {
+        import: bool,
+        export: bool,
+        clear: bool,
+    },
+    /// Generate a key; the parameters arrive via INQUIRE KEYPARAM.
+    Genkey {
+        no_protection: bool,
+    },
+    /// `--verify` checks the key is usable; otherwise re-protect it.
+    Passwd {
+        verify: bool,
+        keygrip: String,
+    },
+    /// Hand a secret key to gpg, wrapped with the KEYWRAP_KEY --export key.
+    ExportKey {
+        openpgp: bool,
+        mode1003: bool,
+        keygrip: String,
+    },
+    /// Store a secret key; the wrapped key arrives via INQUIRE KEYDATA.
+    ImportKey {
+        force: bool,
+        mode1003: bool,
+    },
     PresetPassphrase {
         keygrip: String,
         ttl: i32,
@@ -166,6 +198,33 @@ pub fn parse_command(line: &str) -> Result<Command> {
         }),
         "SETHASH" => parse_sethash(args),
         "PKSIGN" => Ok(Command::PkSign),
+        "PKDECRYPT" => Ok(Command::PkDecrypt {
+            kem: args.split_whitespace().find_map(|arg| match arg {
+                "--kem" => Some("PQC-PGP".to_string()),
+                _ => arg.strip_prefix("--kem=").map(str::to_string),
+            }),
+        }),
+        "KEYWRAP_KEY" => Ok(Command::KeywrapKey {
+            import: has_option(args, "--import"),
+            export: has_option(args, "--export"),
+            clear: has_option(args, "--clear"),
+        }),
+        "GENKEY" => Ok(Command::Genkey {
+            no_protection: has_option(args, "--no-protection"),
+        }),
+        "PASSWD" => Ok(Command::Passwd {
+            verify: has_option(args, "--verify"),
+            keygrip: last_keygrip(args)?,
+        }),
+        "EXPORT_KEY" => Ok(Command::ExportKey {
+            openpgp: has_option(args, "--openpgp"),
+            mode1003: has_option(args, "--mode1003"),
+            keygrip: last_keygrip(args)?,
+        }),
+        "IMPORT_KEY" => Ok(Command::ImportKey {
+            force: has_option(args, "--force"),
+            mode1003: has_option(args, "--mode1003"),
+        }),
         "PRESET_PASSPHRASE" => parse_preset_passphrase(args),
         "GETINFO" => Ok(Command::GetInfo {
             what: args.to_string(),
@@ -173,6 +232,48 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "BYE" => Ok(Command::Bye),
         _ => Ok(Command::Unknown(line.to_string())),
     }
+}
+
+/// The keygrip argument after any options.
+fn last_keygrip(args: &str) -> Result<String> {
+    args.split_whitespace()
+        .rfind(|arg| !arg.starts_with("--"))
+        .filter(|g| g.len() == 40 && g.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_uppercase)
+        .ok_or(Error::MissingField("keygrip"))
+}
+
+/// Whether `args` contains `--name` (alone or as `--name=value`).
+fn has_option(args: &str, name: &str) -> bool {
+    args.split_whitespace().any(|arg| {
+        arg == name
+            || arg
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
+}
+
+/// Decode the data of a `D` line: Assuan escapes `%`, CR and LF (and may
+/// escape other bytes) as `%XX`; unlike SETKEYDESC there is no `+` for space.
+pub fn unescape_data(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == b'%' {
+            if let Some(byte) = data
+                .get(i + 1..i + 3)
+                .and_then(|hex| std::str::from_utf8(hex).ok())
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+            {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(data[i]);
+        i += 1;
+    }
+    out
 }
 
 fn parse_option(args: &str) -> Result<Command> {
@@ -313,6 +414,53 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_lines_unescape_without_plus() {
+        assert_eq!(unescape_data(b"a+b%25%0A%0d\xff"), b"a+b%\n\r\xff");
+        assert_eq!(unescape_data(b"100%zz"), b"100%zz");
+    }
+
+    #[test]
+    fn import_and_keywrap_options_parse() {
+        match parse_command("IMPORT_KEY --timestamp=20261107T000000 --force abc").unwrap() {
+            Command::ImportKey { force, mode1003 } => assert!(force && !mode1003),
+            other => panic!("{other:?}"),
+        }
+        match parse_command("KEYWRAP_KEY --import").unwrap() {
+            Command::KeywrapKey {
+                import,
+                export,
+                clear,
+            } => assert!(import && !export && !clear),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn passwd_and_export_take_the_keygrip_after_options() {
+        let grip = "7CA0B63C83E6BCCCBA2F9AD03913A91AFCB94246";
+        match parse_command(&format!("PASSWD  --verify {grip}")).unwrap() {
+            Command::Passwd { verify, keygrip } => assert!(verify && keygrip == grip),
+            other => panic!("{other:?}"),
+        }
+        match parse_command(&format!(
+            "EXPORT_KEY --openpgp  --cache-nonce=73057 {}",
+            grip.to_lowercase()
+        ))
+        .unwrap()
+        {
+            Command::ExportKey {
+                openpgp,
+                mode1003,
+                keygrip,
+            } => {
+                assert!(openpgp && !mode1003 && keygrip == grip);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(parse_command("PASSWD --verify").is_err());
+    }
 
     #[test]
     fn percent_decode_ascii_and_plus() {

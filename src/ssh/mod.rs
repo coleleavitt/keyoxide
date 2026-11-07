@@ -4,8 +4,9 @@ pub mod protocol;
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use protocol::{Request, Response, SSH_AGENT_RSA_SHA2_512};
-use ssh_key::{Algorithm, HashAlg};
+use keys::RsaHash;
+use protocol::{Request, Response, SSH_AGENT_RSA_SHA2_256, SSH_AGENT_RSA_SHA2_512};
+use ssh_key::Algorithm;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, error, info, warn};
@@ -57,17 +58,21 @@ fn handle_request(request: &Request, state: &AgentState) -> Response {
             data,
             flags,
         } => handle_sign_request(state, key_blob, data, *flags),
-        Request::AddIdentity { .. } => {
-            debug!("add identity request ignored (keys loaded at startup)");
-            Response::Success
+        // Keys come from ~/.ssh at startup. Reporting success here would tell
+        // `ssh-add` a key was added or removed when nothing changed.
+        Request::AddIdentity { .. }
+        | Request::RemoveIdentity { .. }
+        | Request::RemoveAllIdentities => {
+            debug!("identity changes are not supported (keys load at startup)");
+            Response::Failure
         }
-        Request::RemoveIdentity { .. } => {
-            debug!("remove identity request ignored");
-            Response::Success
+        Request::Unsupported(msg_type) => {
+            debug!("unsupported SSH agent request type {}", msg_type);
+            Response::Failure
         }
-        Request::RemoveAllIdentities => {
-            debug!("remove all identities request ignored");
-            Response::Success
+        Request::Malformed(e) => {
+            warn!("malformed SSH agent request: {}", e);
+            Response::Failure
         }
     }
 }
@@ -94,15 +99,19 @@ fn handle_sign_request(state: &AgentState, key_blob: &[u8], data: &[u8], flags: 
         }
     };
 
-    let (hash_alg, sig_algorithm) = match key.algorithm() {
+    let (rsa_hash, sig_algorithm) = match key.algorithm() {
         Algorithm::Rsa { .. } => {
             if flags & SSH_AGENT_RSA_SHA2_512 != 0 {
-                (Some(HashAlg::Sha512), "rsa-sha2-512")
+                (RsaHash::Sha512, "rsa-sha2-512")
+            } else if flags & SSH_AGENT_RSA_SHA2_256 != 0 {
+                (RsaHash::Sha256, "rsa-sha2-256")
             } else {
-                (Some(HashAlg::Sha256), "rsa-sha2-256")
+                // No SHA-2 flag: the client wants a legacy SHA-1 "ssh-rsa"
+                // signature; anything else would fail to verify.
+                (RsaHash::Sha1, "ssh-rsa")
             }
         }
-        Algorithm::Ed25519 => (None, "ssh-ed25519"),
+        Algorithm::Ed25519 => (RsaHash::Sha256, "ssh-ed25519"),
         Algorithm::Ecdsa { curve } => {
             let name = match curve.as_str() {
                 "nistp256" => "ecdsa-sha2-nistp256",
@@ -113,7 +122,7 @@ fn handle_sign_request(state: &AgentState, key_blob: &[u8], data: &[u8], flags: 
                     return Response::Failure;
                 }
             };
-            (None, name)
+            (RsaHash::Sha256, name)
         }
         alg => {
             warn!("unsupported algorithm: {:?}", alg);
@@ -121,7 +130,7 @@ fn handle_sign_request(state: &AgentState, key_blob: &[u8], data: &[u8], flags: 
         }
     };
 
-    match key.sign(data, hash_alg) {
+    match key.sign(data, rsa_hash) {
         Ok(sig_data) => {
             let signature = protocol::encode_signature(sig_algorithm, &sig_data);
             debug!("signed data with {} ({})", key.fingerprint, sig_algorithm);

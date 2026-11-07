@@ -34,6 +34,12 @@ pub enum Error {
     #[error("key decryption failed")]
     KeyDecryptionFailed,
 
+    #[error("bad passphrase")]
+    BadPassphrase,
+
+    #[error("key already exists: {0}")]
+    KeyExists(String),
+
     #[error("key not found: {0}")]
     KeyNotFound(String),
 

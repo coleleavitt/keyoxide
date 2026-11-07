@@ -74,6 +74,106 @@ impl SexpNode {
     }
 }
 
+impl SexpNode {
+    /// The leading atom of a list, e.g. `enc-val` in `(enc-val ...)`.
+    pub fn name(&self) -> Option<&[u8]> {
+        self.as_list()?.first()?.as_atom()
+    }
+}
+
+/// Parse a canonical S-expression (`(3:foo2:ab)`), the form used on the
+/// wire and inside protected key blobs.
+pub fn parse_canonical(data: &[u8]) -> Result<SexpNode> {
+    let mut parser = CanonicalParser::new(data);
+    let node = parse_canonical_node(&mut parser)?;
+    if !parser.remaining().is_empty() {
+        return Err(Error::SexpParse("trailing data after S-expression".into()));
+    }
+    Ok(node)
+}
+
+/// Length of the canonical S-expression at the start of `data`, ignoring
+/// anything after it (gpg pads wrapped keys to a multiple of 8 bytes).
+pub fn canonical_len(data: &[u8]) -> Result<usize> {
+    CanonicalParser::new(data).skip_sexp()
+}
+
+fn parse_canonical_node(parser: &mut CanonicalParser) -> Result<SexpNode> {
+    if !parser.peek_is_list() {
+        return Ok(SexpNode::Atom(parser.read_atom()?.to_vec()));
+    }
+    parser.expect_list_start()?;
+    let mut items = Vec::new();
+    while !parser.peek_is_list_end() {
+        if parser.remaining().is_empty() {
+            return Err(Error::SexpParse("unclosed list".into()));
+        }
+        items.push(parse_canonical_node(parser)?);
+    }
+    parser.expect_list_end()?;
+    Ok(SexpNode::List(items))
+}
+
+/// Render in GnuPG's advanced format, as written to `Key:` in key files:
+/// plain tokens where libgcrypt allows them, quoted printable strings, and
+/// `#hex#` for everything else.
+pub fn render_advanced(node: &SexpNode) -> String {
+    let mut out = String::new();
+    render_into(node, &mut out);
+    out
+}
+
+fn render_into(node: &SexpNode, out: &mut String) {
+    match node {
+        SexpNode::List(items) => {
+            out.push('(');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 && matches!(item, SexpNode::Atom(_)) {
+                    out.push(' ');
+                }
+                render_into(item, out);
+            }
+            out.push(')');
+        }
+        SexpNode::Atom(data) => {
+            let token = data.first().is_some_and(u8::is_ascii_alphabetic)
+                && data
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-._:".contains(b));
+            let printable = !data.is_empty()
+                && data
+                    .iter()
+                    .all(|b| (0x20..0x7f).contains(b) && *b != b'"' && *b != b'\\');
+            if token {
+                out.push_str(std::str::from_utf8(data).unwrap_or_default());
+            } else if printable {
+                out.push('"');
+                out.push_str(std::str::from_utf8(data).unwrap_or_default());
+                out.push('"');
+            } else {
+                out.push('#');
+                out.push_str(&hex::encode_upper(data));
+                out.push('#');
+            }
+        }
+    }
+}
+
+/// Append a canonical atom (`<len>:<bytes>`).
+pub fn push_atom(out: &mut Vec<u8>, data: &[u8]) {
+    out.extend_from_slice(data.len().to_string().as_bytes());
+    out.push(b':');
+    out.extend_from_slice(data);
+}
+
+/// Append a canonical `(<name><value>)` pair, e.g. `(1:q33:...)`.
+pub fn push_param(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    out.push(b'(');
+    push_atom(out, name);
+    push_atom(out, value);
+    out.push(b')');
+}
+
 pub fn parse_gpg_sexp(input: &str) -> Result<SexpNode> {
     let mut chars = input.chars().peekable();
     skip_whitespace(&mut chars);
@@ -83,11 +183,12 @@ pub fn parse_gpg_sexp(input: &str) -> Result<SexpNode> {
 fn parse_node(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<SexpNode> {
     skip_whitespace(chars);
 
-    match chars.peek() {
+    match chars.peek().copied() {
         Some('(') => parse_list(chars),
         Some('#') => parse_hex_atom(chars),
         Some('"') => parse_quoted_atom(chars),
-        Some(c) if c.is_alphanumeric() || *c == '-' || *c == '_' => parse_token(chars),
+        Some(c) if c.is_ascii_digit() && is_length_prefixed(chars) => parse_length_prefixed(chars),
+        Some(c) if c.is_alphanumeric() || c == '-' || c == '_' => parse_token(chars),
         Some(c) => Err(Error::SexpParse(format!("unexpected char: {}", c))),
         None => Err(Error::SexpParse("unexpected end of input".to_string())),
     }
@@ -163,6 +264,43 @@ fn parse_quoted_atom(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result
             None => return Err(Error::SexpParse("unclosed string".to_string())),
         }
     }
+}
+
+/// Whether the input continues with `<digits>:`, libgcrypt's length-prefixed
+/// atom, which may appear inside the advanced form (gpg sends
+/// `(genkey(ecc(curve 7:Ed25519)))`).
+fn is_length_prefixed(chars: &std::iter::Peekable<std::str::Chars>) -> bool {
+    let mut look = chars.clone();
+    let mut digits = 0;
+    while look.peek().is_some_and(char::is_ascii_digit) {
+        look.next();
+        digits += 1;
+    }
+    digits > 0 && look.peek() == Some(&':')
+}
+
+fn parse_length_prefixed(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<SexpNode> {
+    let mut len = 0usize;
+    while let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
+        len = len
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(d as usize))
+            .ok_or_else(|| Error::SexpParse("length overflow".into()))?;
+        chars.next();
+    }
+    chars.next(); // ':'
+    let mut data = Vec::with_capacity(len.min(4096));
+    while data.len() < len {
+        let c = chars
+            .next()
+            .ok_or_else(|| Error::SexpParse("atom length out of bounds".into()))?;
+        let mut buf = [0u8; 4];
+        data.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
+    if data.len() != len {
+        return Err(Error::SexpParse("atom length splits a character".into()));
+    }
+    Ok(SexpNode::Atom(data))
 }
 
 fn parse_token(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<SexpNode> {
@@ -351,6 +489,42 @@ mod tests {
         let sexp = parse_gpg_sexp("(count \"12345\")").unwrap();
         let canon = sexp.to_canonical();
         assert_eq!(canon, b"(5:count5:12345)");
+    }
+
+    #[test]
+    fn canonical_roundtrip_and_padding() {
+        let canon = b"(3:foo(1:q3:\x40\x01\x02)5:bar.z)";
+        let node = parse_canonical(canon).unwrap();
+        assert_eq!(node.to_canonical(), canon);
+        assert_eq!(node.name(), Some(&b"foo"[..]));
+        let mut padded = canon.to_vec();
+        padded.extend_from_slice(&[0; 5]);
+        assert_eq!(canonical_len(&padded).unwrap(), canon.len());
+        assert!(parse_canonical(&padded).is_err());
+    }
+
+    #[test]
+    fn advanced_render_parses_back_to_same_canonical() {
+        let canon = b"(21:protected-private-key(3:ecc(5:curve10:NIST P-256)(5:flags5:eddsa)(1:q3:\x40\xff\x00)(12:protected-at15:20261107T052202)))";
+        let node = parse_canonical(canon).unwrap();
+        let text = render_advanced(&node);
+        assert!(text.contains("(curve \"NIST P-256\")"), "{text}");
+        assert!(
+            text.contains("(protected-at \"20261107T052202\")"),
+            "{text}"
+        );
+        assert_eq!(parse_gpg_sexp(&text).unwrap().to_canonical(), canon);
+    }
+
+    #[test]
+    fn advanced_form_accepts_length_prefixed_atoms() {
+        let node = parse_gpg_sexp("(genkey(ecc(curve 10:NIST P-256)(flags nocomp)))").unwrap();
+        assert_eq!(
+            node.to_canonical(),
+            b"(6:genkey(3:ecc(5:curve10:NIST P-256)(5:flags6:nocomp)))"
+        );
+        let rsa = parse_gpg_sexp("(genkey(rsa(nbits 4:2048)))").unwrap();
+        assert_eq!(rsa.to_canonical(), b"(6:genkey(3:rsa(5:nbits4:2048)))");
     }
 
     #[test]

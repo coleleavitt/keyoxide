@@ -34,6 +34,11 @@ pub enum Request {
         key_blob: Bytes,
     },
     RemoveAllIdentities,
+    /// A request keyoxide does not implement, e.g. SSH_AGENTC_EXTENSION
+    /// (`session-bind@openssh.com`, sent by OpenSSH 8.9+ on every use).
+    Unsupported(u8),
+    /// A frame whose payload could not be parsed.
+    Malformed(Error),
 }
 
 #[derive(Debug)]
@@ -67,7 +72,9 @@ pub fn parse_message(data: &[u8]) -> Result<Option<(Request, usize)>> {
     let msg_type = data[4];
     let payload = &data[5..total_len];
 
-    let request = parse_request(msg_type, payload)?;
+    // A bad payload is answered with SSH_AGENT_FAILURE; only a broken frame
+    // (above) ends the connection, since the stream cannot be resynced then.
+    let request = parse_request(msg_type, payload).unwrap_or_else(Request::Malformed);
     Ok(Some((request, total_len)))
 }
 
@@ -78,10 +85,7 @@ fn parse_request(msg_type: u8, payload: &[u8]) -> Result<Request> {
         SSH2_AGENTC_ADD_IDENTITY => parse_add_identity(payload),
         SSH2_AGENTC_REMOVE_IDENTITY => parse_remove_identity(payload),
         SSH2_AGENTC_REMOVE_ALL_IDENTITIES => Ok(Request::RemoveAllIdentities),
-        _ => Err(Error::InvalidCommand(format!(
-            "unknown message type: {}",
-            msg_type
-        ))),
+        _ => Ok(Request::Unsupported(msg_type)),
     }
 }
 
@@ -226,10 +230,26 @@ mod tests {
     }
 
     #[test]
-    fn sign_request_with_truncated_string_errors() {
+    fn sign_request_with_truncated_string_is_malformed_not_fatal() {
         // type=SIGN_REQUEST, then a length prefix claiming 99 bytes with none present.
         let mut frame = vec![0u8, 0, 0, 5, SSH2_AGENTC_SIGN_REQUEST];
         frame.extend_from_slice(&[0, 0, 0, 99]);
-        assert!(matches!(parse_message(&frame), Err(Error::BufferTooShort)));
+        let (req, consumed) = parse_message(&frame).unwrap().unwrap();
+        assert_eq!(consumed, frame.len());
+        assert!(matches!(req, Request::Malformed(Error::BufferTooShort)));
+    }
+
+    #[test]
+    fn extension_request_is_unsupported_not_fatal() {
+        // SSH_AGENTC_EXTENSION "session-bind@openssh.com", as OpenSSH sends it.
+        let name = b"session-bind@openssh.com";
+        let mut payload = vec![27u8];
+        payload.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        payload.extend_from_slice(name);
+        let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&payload);
+        let (req, consumed) = parse_message(&frame).unwrap().unwrap();
+        assert_eq!(consumed, frame.len());
+        assert!(matches!(req, Request::Unsupported(27)));
     }
 }

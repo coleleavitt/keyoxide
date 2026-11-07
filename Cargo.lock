@@ -38,6 +38,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes-kw"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69fa2b352dcefb5f7f3a5fb840e02665d311d878955380515e4fd50095dd3d8c"
+dependencies = [
+ "aes",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -138,6 +147,15 @@ name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
+name = "cfb-mode"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "738b8d467867f80a71351933f70461f5b56f24d5c93e0cf216e59229c968d330"
 dependencies = [
  "cipher",
 ]
@@ -531,13 +549,14 @@ name = "keyoxide"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "aes-kw",
  "base64",
  "bytes",
  "cbc",
+ "cfb-mode",
  "dirs",
  "ed25519-dalek",
  "hex",
- "lexpr",
  "libc",
  "ocb3",
  "p256",
@@ -556,6 +575,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -573,27 +593,6 @@ name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
-
-[[package]]
-name = "lexpr"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a84de6a9df442363b08f5dbf0cd5b92edc70097b89c4ce4bfea4679fe48bc67"
-dependencies = [
- "itoa",
- "lexpr-macros",
- "ryu",
-]
-
-[[package]]
-name = "lexpr-macros"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36b5cb8bb985c81a8ac1a0f8b5c4865214f574ddd64397ef7a99c236e21f35bb"
-dependencies = [
- "proc-macro2",
- "quote",
-]
 
 [[package]]
 name = "libc"
@@ -1050,12 +1049,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ryu"
-version = "1.0.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1098,6 +1091,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -1635,6 +1629,18 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core",
+ "serde",
+ "zeroize",
 ]
 
 [[package]]
